@@ -1,0 +1,202 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defaults, loadConfig, type ConfigResult } from "./config.ts";
+import { notifierArgumentCompletions, withNotifierCompletions } from "./completion.ts";
+import { createWindowsBackend, windowsPaths, type Backend } from "./launcher.ts";
+import { NotificationScheduler, systemClock, type Clock, type Submission } from "./scheduler.ts";
+import { NotificationState } from "./state.ts";
+import { KINDS, type NotificationKind } from "./types.ts";
+
+export interface RuntimeOptions {
+  platform?: NodeJS.Platform;
+  arch?: string;
+  readConfig?: () => ConfigResult;
+  backend?: () => Backend;
+  clock?: Clock;
+}
+interface Session {
+  context: ExtensionContext;
+  state: NotificationState;
+  scheduler?: NotificationScheduler;
+  result: ConfigResult;
+  backendCode: string;
+  diagnostics: Set<string>;
+  unsubscribe: Array<() => void>;
+  disposed: boolean;
+  lastWarning: number;
+  testId: number;
+}
+const SUBMISSION_MESSAGES: Record<Submission["status"], string> = {
+  submitted: "Test notification submitted. Windows settings determine whether it is displayed or heard.",
+  partial: "Test notification partially submitted. Run /windows-notifier status for diagnostic codes.",
+  disabled: "Notifications are disabled, or this environment/event is unsupported.",
+  cancelled: "Test notification cancelled.",
+  dropped: "Test notification dropped because the queue is full.",
+  expired: "Test notification expired while waiting in the queue.",
+  failed: "Test notification submission failed. Run /windows-notifier status for diagnostic codes.",
+};
+
+/** Only safe status fields are shown; the detail view never contains custom text, file paths, or session content. */
+function formatStatus(target: Session | undefined, detail: boolean): string {
+  const config = target?.result.config;
+  const queue = target?.scheduler?.status();
+  const onOff = (enabled: boolean) => enabled ? "On" : "Off";
+  const diagnostics = [...(target?.diagnostics ?? [])];
+  const lines = [
+    "Windows notifier status",
+    `Global: ${onOff(config?.enabled ?? false)}`,
+    `Backend: ${target?.backendCode ?? "NOT_STARTED"}`,
+    `Configured events: ${config ? `${KINDS.filter(kind => config.events[kind].enabled).length} / ${KINDS.length} enabled` : "Not loaded"}`,
+    `Queue: ${queue ? `Queued ${queue.queued} · Dropped ${queue.dropped}` : "Unavailable"}`,
+    `Helper: ${queue ? queue.active ? "Running" : "Idle" : "Unavailable"}`,
+    `Diagnostics: ${diagnostics.length ? diagnostics.join(", ") : "None"}`,
+  ];
+  if (detail) {
+    lines.push("", `Schema version: ${config?.schemaVersion ?? "Not loaded"}`,
+      "Event details (configured values; global switch and backend still apply):");
+    if (config) {
+      for (const kind of KINDS) {
+        const event = config.events[kind];
+        // File sounds are shown only when the volume is below 1; system sounds have no volume interface and are never shown.
+        const source = event.sound.source.type === "system" ? event.sound.source.name
+          : event.sound.volume < 1 ? `WAV file, volume ${Math.round(event.sound.volume * 100)}%` : "WAV file";
+        lines.push(`  ${kind.padEnd(10)}  Event: ${onOff(event.enabled)}  Toast: ${onOff(event.toast.enabled)}  Sound: ${onOff(event.sound.enabled)} (${source})`);
+      }
+    } else lines.push("  Not loaded");
+  } else lines.push("", "Details: /windows-notifier status all");
+  return lines.join("\n");
+}
+
+/** The factory only registers APIs; processes, timers, and event bus subscriptions all belong to a started session. */
+export function registerNotifier(pi: ExtensionAPI, options: RuntimeOptions = {}): void {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  // Captures only the required OS environment; the agent's full environment and API tokens are not kept.
+  const environment = windowsPaths(process.env)?.env ?? {};
+  const makeBackend = options.backend ?? (() => createWindowsBackend({ env: environment, platform, arch }));
+  const readConfig = options.readConfig ?? loadConfig;
+  const clock = options.clock ?? systemClock;
+  let session: Session | undefined;
+  let lifecycle = Promise.resolve();
+  let hadSession = false;
+  let preSessionEvents = 0;
+  // reload/session start/shutdown must be serialized, so a new session isn't created while a previous helper hasn't closed.
+  const transition = (action: () => Promise<void>) => {
+    const next = lifecycle.then(action);
+    lifecycle = next.catch(() => {});
+    return next;
+  };
+
+  const diagnose = (target: Session, code: string) => {
+    if (target.disposed) return;
+    if (target.diagnostics.size < 32) target.diagnostics.add(code);
+    const now = clock.now();
+    try {
+      if (target.context.mode !== "tui" || !target.context.hasUI || now - target.lastWarning < 60_000) return;
+      target.lastWarning = now;
+      target.context.ui.notify(`Windows notifier: ${code}. Run /windows-notifier status to check the status.`, "warning");
+    } catch { /* A stale context/UI during a session change must not affect the agent. */ }
+  };
+  const stop = async () => {
+    const previous = session;
+    session = undefined;
+    if (!previous) return;
+    previous.disposed = true;
+    for (const unsubscribe of previous.unsubscribe) { try { unsubscribe(); } catch {} }
+    previous.unsubscribe = [];
+    previous.state.reset();
+    await previous.scheduler?.close();
+  };
+  const start = async (context: ExtensionContext) => {
+    await stop();
+    let result: ConfigResult;
+    try { result = readConfig(); }
+    catch { result = { ok: false, code: "CONFIG_READ_FAILED", config: { ...defaults(), enabled: false } }; }
+    const eligible = platform === "win32" && ["x64", "arm64"].includes(arch) && context.mode === "tui" && context.hasUI;
+    let backend: Backend | undefined;
+    try { if (eligible) backend = makeBackend(); } catch { /* The backend's raw error is never displayed. */ }
+    const target: Session = {
+      context, state: undefined!, result, backendCode: eligible ? backend?.code ?? "BACKEND_UNAVAILABLE" : "ENV_UNSUPPORTED",
+      diagnostics: new Set(), unsubscribe: [], disposed: false, lastWarning: -Infinity, testId: 0,
+    };
+    const scheduler = backend && eligible
+      ? new NotificationScheduler(backend, () => target.result.config, code => diagnose(target, code), clock) : undefined;
+    target.scheduler = scheduler;
+    target.state = new NotificationState(scheduler ?? { enqueue() {}, cancel() {} }, code => diagnose(target, code));
+    session = target;
+    hadSession = true;
+    // If session_start's start() is still awaiting, agent_start/message_end are lost entirely,
+    // so that run has no run state and no completion notification plays; record a code here for status to trace.
+    if (preSessionEvents) { diagnose(target, "PRE_SESSION_EVENTS"); preSessionEvents = 0; }
+    if (!result.ok) diagnose(target, result.code);
+    if (eligible && !backend?.available) diagnose(target, "BACKEND_UNAVAILABLE");
+    if (!eligible) return;
+    const listen = (channel: string, handler: (raw: unknown) => void) => {
+      target.unsubscribe.push(pi.events.on(channel, raw => {
+        if (target.disposed || session !== target) return;
+        try { handler(raw); } catch { diagnose(target, "EVENT_INVALID"); }
+      }));
+    };
+    listen("permissions:ui_prompt", raw => target.state.permissionPrompt(raw));
+    listen("permissions:decision", raw => target.state.permissionDecision(raw));
+    listen("rpiv:ask-user:blocked", raw => target.state.rpivBlocked(raw));
+  };
+  const observe = (handler: (state: NotificationState) => void) => {
+    const target = session;
+    if (!target) {
+      if (!hadSession) preSessionEvents++;
+      return;
+    }
+    if (target.disposed || target.backendCode === "ENV_UNSUPPORTED") return;
+    try { handler(target.state); } catch { diagnose(target, "EVENT_INVALID"); }
+  };
+  pi.on("session_start", async (_event, context) => {
+    if (context.mode === "tui" && context.hasUI) context.ui.addAutocompleteProvider(withNotifierCompletions);
+    await transition(() => start(context));
+  });
+  pi.on("session_shutdown", async () => { await transition(stop); });
+  pi.on("tool_execution_start", event => { observe(state => state.toolStart(event)); });
+  pi.on("tool_execution_end", event => { observe(state => state.toolEnd(event)); });
+  pi.on("ui_prompt_start", () => { observe(state => state.uiStart()); });
+  pi.on("ui_prompt_end", () => { observe(state => state.uiEnd()); });
+  pi.on("agent_start", () => { observe(state => state.agentStart()); });
+  pi.on("message_end", event => { observe(state => state.messageEnd(event)); });
+  pi.on("turn_end", event => { observe(state => state.boundary(event)); });
+  pi.on("agent_before_settle", event => { observe(state => state.boundary(event)); });
+  pi.on("agent_settled", event => { observe(state => state.settled(event)); });
+
+  pi.registerCommand("windows-notifier", {
+    description: "Windows notifications: status [all], reload, test [permission|question|completed|aborted|failed]",
+    getArgumentCompletions: notifierArgumentCompletions,
+    handler: async (args, context) => {
+      const parts = args.trim().split(/\s+/u);
+      if (parts.length === 1 && parts[0] === "reload") {
+        await transition(() => start(context));
+        context.ui.notify("Windows notifier configuration reloaded. Run /windows-notifier status to check the effective status.", "info");
+        return;
+      }
+      const target = session;
+      if (!args.trim() || parts[0] === "status" &&
+          (parts.length === 1 || parts.length === 2 && parts[1] === "all")) {
+        context.ui.notify(formatStatus(target, parts.length === 2), "info");
+        return;
+      }
+      if (parts[0] === "test" && parts.length <= 2 &&
+          (parts[1] === undefined || KINDS.includes(parts[1] as NotificationKind))) {
+        if (!target?.scheduler || target.disposed) {
+          context.ui.notify(SUBMISSION_MESSAGES.disabled, "warning");
+          return;
+        }
+        const kind = (parts[1] ?? "completed") as NotificationKind;
+        // Report the request first so the UI doesn't wait for the queue, sound playback, and helper close; nothing is claimed as submitted yet.
+        context.ui.notify(`Test notification requested (${kind}); waiting for the result.`, "info");
+        const result = await target.scheduler.submit({ key: "test:" + ++target.testId,
+          kind, valid: () => session === target && !target.disposed });
+        // After a reload or session change, an invalidated command context is no longer used.
+        if (session === target && !target.disposed) context.ui.notify(SUBMISSION_MESSAGES[result.status],
+          result.status === "submitted" ? "info" : "warning");
+        return;
+      }
+      context.ui.notify("Usage: /windows-notifier status [all] | reload | test [permission|question|completed|aborted|failed]", "warning");
+    },
+  });
+}

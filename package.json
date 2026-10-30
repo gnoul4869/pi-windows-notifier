@@ -1,0 +1,49 @@
+{
+  "name": "pi-windows-notifier",
+  "version": "0.1.0",
+  "description": "Built for Windows. Zero dependencies. Customizable, security-first notifications and alert sounds for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gnoul4869/pi-windows-notifier.git"
+  },
+  "homepage": "https://github.com/gnoul4869/pi-windows-notifier",
+  "bugs": {
+    "url": "https://github.com/gnoul4869/pi-windows-notifier/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "windows",
+    "notifications"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "src/*.ps1",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "^22.15.3",
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "verify": "npm run check && npm test"
+  }
+}

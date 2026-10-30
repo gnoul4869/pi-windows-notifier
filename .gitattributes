@@ -1,0 +1,5 @@
+# Normalize the repository to LF in the object database and in the working tree.
+# Without this, a `core.autocrlf=true` checkout turns every source file into CRLF,
+# which breaks the README examples test (its ```json fence regex expects LF).
+* text=auto eol=lf
+*.png binary
